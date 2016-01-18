@@ -17,10 +17,12 @@ upstream backend
 }  
 
 #Usage and Complie:
-```patch -p1 < nginx-1.9.9.patch```  
-```./configure```  
-```make```  
-```make install``` 
+```go
+patch -p1 < nginx-1.9.9.patch
+./configure
+make
+make install
+```  
 
 #Chinese Describtion:
 &nbsp;&nbsp;&nbsp;&nbsp;在实际生产过程中，可能每台backend server的配置不同，导致存在不同的系能瓶颈，一旦请求并发数超过阈值，会造成雪崩效应，使服务器连阈值内的请求量都处理不了。  
