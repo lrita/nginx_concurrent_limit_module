@@ -1,0 +1,306 @@
+# HG changeset patch
+# User huyq
+# Date 1453102452 -28800
+# Node ID 784fe17a6136e5cde76daeba33deaea437ea34fd
+# Parent  cbb15e547a7a221a99d67feabf149470b4897ca1
+
+diff -r cbb15e547a7a -r 784fe17a6136 src/http/ngx_http_upstream.c
+--- a/src/http/ngx_http_upstream.c	Sat Jan 16 22:58:53 2016 +0800
++++ b/src/http/ngx_http_upstream.c	Mon Jan 18 15:34:12 2016 +0800
+@@ -5393,6 +5393,7 @@
+     ngx_str_t                   *value, s;
+     ngx_url_t                    u;
+     ngx_int_t                    weight, max_fails;
++    ngx_int_t			 concurrent;
+     ngx_uint_t                   i;
+     ngx_http_upstream_server_t  *us;
+ 
+@@ -5406,6 +5407,7 @@
+     value = cf->args->elts;
+ 
+     weight = 1;
++    concurrent = NGX_MAX_INT32_VALUE;
+     max_fails = 1;
+     fail_timeout = 10;
+ 
+@@ -5481,6 +5483,23 @@
+             continue;
+         }
+ 
++        if (ngx_strncmp(value[i].data, "concurrent=", 11) == 0) {
++
++#if 0
++            if (!(uscf->flags & NGX_HTTP_UPSTREAM_FAIL_TIMEOUT)) {
++                goto not_supported;
++            }
++#endif
++
++            concurrent = ngx_atoi(&value[i].data[11], value[i].len - 11);
++
++            if (concurrent == NGX_ERROR) {
++                goto invalid;
++            }
++
++            continue;
++        }
++
+         goto invalid;
+     }
+ 
+@@ -5502,6 +5521,7 @@
+     us->addrs = u.addrs;
+     us->naddrs = u.naddrs;
+     us->weight = weight;
++    us->concurrent = concurrent;
+     us->max_fails = max_fails;
+     us->fail_timeout = fail_timeout;
+ 
+diff -r cbb15e547a7a -r 784fe17a6136 src/http/ngx_http_upstream.h
+--- a/src/http/ngx_http_upstream.h	Sat Jan 16 22:58:53 2016 +0800
++++ b/src/http/ngx_http_upstream.h	Mon Jan 18 15:34:12 2016 +0800
+@@ -93,6 +93,7 @@
+     ngx_addr_t                      *addrs;
+     ngx_uint_t                       naddrs;
+     ngx_uint_t                       weight;
++    ngx_int_t                        concurrent;
+     ngx_uint_t                       max_fails;
+     time_t                           fail_timeout;
+ 
+diff -r cbb15e547a7a -r 784fe17a6136 src/http/ngx_http_upstream_round_robin.c
+--- a/src/http/ngx_http_upstream_round_robin.c	Sat Jan 16 22:58:53 2016 +0800
++++ b/src/http/ngx_http_upstream_round_robin.c	Mon Jan 18 15:34:12 2016 +0800
+@@ -25,6 +25,46 @@
+     void *data);
+ 
+ #endif
++#define CONCURRENT_SHM_BASE	(1024)
++static ngx_int_t ngx_http_upstream_round_robin_shm_init(ngx_shm_zone_t *shm_zone,
++	       void *data)
++{
++	ngx_http_upstream_rr_peers_t  *peers;
++	ngx_http_upstream_rr_peer_t   *peer;
++	u_char                        *addr;
++
++	peers = (ngx_http_upstream_rr_peers_t*)shm_zone->data;
++	addr = shm_zone->shm.addr + CONCURRENT_SHM_BASE;
++	for (peer = peers->peer; peer; peer = peer->next) {
++
++		peer->concurrent_lock.spin = (ngx_uint_t)-1;
++		if (ngx_shmtx_create(&peer->concurrent_lock, (ngx_shmtx_sh_t*)addr, NULL) != NGX_OK) {
++			return NGX_ERROR;
++		}
++		addr += sizeof(ngx_shmtx_sh_t);
++		peer->concurrent_current = (ngx_int_t*)addr;
++		*peer->concurrent_current = 0;
++		addr += sizeof(ngx_int_t);
++	}
++
++	peers = peers->next;
++	if (peers) {
++		for (peer = peers->peer; peer; peer = peer->next) {
++
++			peer->concurrent_lock.spin = (ngx_uint_t)-1;
++			if (ngx_shmtx_create(&peer->concurrent_lock, (ngx_shmtx_sh_t*)addr, NULL) != NGX_OK) {
++				return NGX_ERROR;
++			}
++			addr += sizeof(ngx_shmtx_sh_t);
++			peer->concurrent_current = (ngx_int_t*)addr;
++			*peer->concurrent_current = 0;
++			addr += sizeof(ngx_int_t);
++		
++		}
++	}
++
++	return NGX_OK;
++}
+ 
+ 
+ ngx_int_t
+@@ -36,9 +76,14 @@
+     ngx_http_upstream_server_t    *server;
+     ngx_http_upstream_rr_peer_t   *peer, **peerp;
+     ngx_http_upstream_rr_peers_t  *peers, *backup;
++    ngx_shm_zone_t                *shm_zone;
++    ngx_str_t                     *name;
++    ngx_int_t                      peer_num;
+ 
+     us->peer.init = ngx_http_upstream_init_round_robin_peer;
+ 
++    peer_num = 0;
++    name = &(us->host);
+     if (us->servers) {
+         server = us->servers->elts;
+ 
+@@ -71,6 +116,7 @@
+             return NGX_ERROR;
+         }
+ 
++        peer_num += n;
+         peers->single = (n == 1);
+         peers->number = n;
+         peers->weighted = (w != n);
+@@ -90,6 +136,7 @@
+                 peer[n].socklen = server[i].addrs[j].socklen;
+                 peer[n].name = server[i].addrs[j].name;
+                 peer[n].weight = server[i].weight;
++                peer[n].concurrent = server[i].concurrent;
+                 peer[n].effective_weight = server[i].weight;
+                 peer[n].current_weight = 0;
+                 peer[n].max_fails = server[i].max_fails;
+@@ -119,6 +166,21 @@
+             w += server[i].naddrs * server[i].weight;
+         }
+ 
++	peer_num += n;
++	shm_zone = ngx_shared_memory_add(cf, name, 
++			CONCURRENT_SHM_BASE + peer_num * (sizeof(ngx_int_t) + sizeof(ngx_shmtx_sh_t)), 
++			&ngx_http_upstream_round_robin_shm_init);
++        if (shm_zone == NULL) {
++            return NGX_ERROR;
++        }
++
++        if (shm_zone->data) {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "upstream \"%V\" is duplicate", name);
++            return NGX_ERROR;
++        }
++        shm_zone->data = peers;
++        shm_zone->init = ngx_http_upstream_round_robin_shm_init;
++	//TODO
+         if (n == 0) {
+             return NGX_OK;
+         }
+@@ -153,6 +215,7 @@
+                 peer[n].socklen = server[i].addrs[j].socklen;
+                 peer[n].name = server[i].addrs[j].name;
+                 peer[n].weight = server[i].weight;
++                peer[n].concurrent = server[i].concurrent;
+                 peer[n].effective_weight = server[i].weight;
+                 peer[n].current_weight = 0;
+                 peer[n].max_fails = server[i].max_fails;
+@@ -221,6 +284,7 @@
+         peer[i].socklen = u.addrs[i].socklen;
+         peer[i].name = u.addrs[i].name;
+         peer[i].weight = 1;
++	peer[n].concurrent = NGX_MAX_INT32_VALUE;
+         peer[i].effective_weight = 1;
+         peer[i].current_weight = 0;
+         peer[i].max_fails = 1;
+@@ -231,6 +295,22 @@
+ 
+     us->peer.data = peers;
+ 
++#if 0
++    peer_num += u.naddrs;
++    shm_zone = ngx_shared_memory_add(cf, name, 
++                CONCURRENT_SHM_BASE + peer_num * (sizeof(ngx_int_t) + sizeof(ngx_shmtx_sh_t)), 
++		&ngx_http_upstream_round_robin_shm_init);
++    if (shm_zone == NULL) {
++        return NGX_ERROR;
++    }
++
++    if (shm_zone->data) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "upstream \"%V\" is duplicate", name);
++        return NGX_ERROR;
++    }
++    shm_zone->data = peers;
++    shm_zone->init = ngx_http_upstream_round_robin_shm_init;
++#endif
+     /* implicitly defined upstream has no backup servers */
+ 
+     return NGX_OK;
+@@ -335,6 +415,7 @@
+         peer[0].socklen = ur->socklen;
+         peer[0].name = ur->host;
+         peer[0].weight = 1;
++        peer[0].concurrent = NGX_MAX_INT32_VALUE;
+         peer[0].effective_weight = 1;
+         peer[0].current_weight = 0;
+         peer[0].max_fails = 1;
+@@ -377,6 +458,7 @@
+             peer[i].name.len = len;
+             peer[i].name.data = p;
+             peer[i].weight = 1;
++            peer[i].concurrent = NGX_MAX_INT32_VALUE;
+             peer[i].effective_weight = 1;
+             peer[i].current_weight = 0;
+             peer[i].max_fails = 1;
+@@ -441,6 +523,20 @@
+             goto failed;
+         }
+ 
++	if (peer->concurrent != NGX_MAX_INT32_VALUE) {
++
++		ngx_shmtx_lock(&peer->concurrent_lock);
++
++		if (*peer->concurrent_current < peer->concurrent) {
++			++(*peer->concurrent_current);
++			ngx_shmtx_unlock(&peer->concurrent_lock);
++		}
++		else {
++			ngx_shmtx_unlock(&peer->concurrent_lock);
++            		goto failed;
++		}
++	}
++
+         rrp->current = peer;
+ 
+     } else {
+@@ -557,6 +653,25 @@
+         }
+ 
+         if (best == NULL || peer->current_weight > best->current_weight) {
++
++            if (peer->concurrent != NGX_MAX_INT32_VALUE) {
++                ngx_shmtx_lock(&peer->concurrent_lock);
++
++                if (peer->concurrent <= *peer->concurrent_current) {
++                    ngx_shmtx_unlock(&peer->concurrent_lock);
++		    continue;
++		}
++
++                ++(*peer->concurrent_current);
++                ngx_shmtx_unlock(&peer->concurrent_lock);
++            }
++
++            if (best->concurrent != NGX_MAX_INT32_VALUE) {
++                ngx_shmtx_lock(&best->concurrent_lock);
++                --(*best->concurrent_current);
++                ngx_shmtx_unlock(&best->concurrent_lock);
++            }
++
+             best = peer;
+             p = i;
+         }
+@@ -602,6 +717,12 @@
+     ngx_http_upstream_rr_peers_rlock(rrp->peers);
+     ngx_http_upstream_rr_peer_lock(rrp->peers, peer);
+ 
++    if (peer->concurrent != NGX_MAX_INT32_VALUE) {
++        ngx_shmtx_lock(&peer->concurrent_lock);
++        --(*peer->concurrent_current);
++        ngx_shmtx_unlock(&peer->concurrent_lock);
++    }
++
+     if (rrp->peers->single) {
+ 
+         peer->conns--;
+diff -r cbb15e547a7a -r 784fe17a6136 src/http/ngx_http_upstream_round_robin.h
+--- a/src/http/ngx_http_upstream_round_robin.h	Sat Jan 16 22:58:53 2016 +0800
++++ b/src/http/ngx_http_upstream_round_robin.h	Mon Jan 18 15:34:12 2016 +0800
+@@ -25,6 +25,7 @@
+     ngx_int_t                       current_weight;
+     ngx_int_t                       effective_weight;
+     ngx_int_t                       weight;
++    ngx_int_t                       concurrent;
+ 
+     ngx_uint_t                      conns;
+ 
+@@ -47,6 +48,8 @@
+ #if (NGX_HTTP_UPSTREAM_ZONE)
+     ngx_atomic_t                    lock;
+ #endif
++    ngx_shmtx_t			    concurrent_lock;
++    volatile ngx_int_t		    *concurrent_current;
+ };
+ 
+ 
